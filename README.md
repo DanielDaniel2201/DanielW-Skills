@@ -11,5 +11,14 @@ A collection of custom skills for AI agents, organized by learning-focused, cont
 ## Skills
 
 - **learn-skills/youtube-podcast**: Tools and instructions for processing YouTube podcast transcripts and generating mindmaps.
+  ```powershell
+  npx skills add DanielDaniel2201/DanielW-Skills --skill youtube-podcast
+  ```
 - **content-skills/doubao-asr**: Standalone Doubao ASR workflow for turning local audio or video files into SRT subtitles.
+  ```powershell
+  npx skills add DanielDaniel2201/DanielW-Skills --skill doubao-asr
+  ```
 - **swe-skills/check-postmortem**: Review prior bug-fix postmortems under `.agents/postmortem` and surface similar historical fixes before starting a new bug fix.
+  ```powershell
+  npx skills add DanielDaniel2201/DanielW-Skills --skill check-postmortem
+  ```
