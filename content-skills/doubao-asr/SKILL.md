@@ -89,9 +89,38 @@ node scripts/doubao-asr.mjs
 1. 从视频里抽出 16k、单声道、低码率 `mp3`
 2. 把音频转成 base64，请求录音文件识别 1.0 极速版
 3. 保存原始返回和字级时间戳
-4. 按 10 到 15 个字、停顿和标点合并成字幕组
-5. 智能清理常见口水词
-6. 输出可导入剪映的 `srt`
+4. 优先读取豆包返回的 `utterances` 作为自然语音分段底稿
+5. 在每个 `utterance` 内按标点、停顿和字幕长度生成候选字幕
+6. 用 `utterance.words` 里的字词级时间戳校准每条字幕的起止时间
+7. 用脚本规则合并太短字幕、拆短太长字幕
+8. 输出字幕文本时去掉中文和英文常见标点
+9. 智能清理常见口水词
+10. 输出可导入剪映的 `srt`
+
+默认字幕生成是****确定性脚本规则****，不是 AI 临场判断
+
+- 豆包 ASR 负责识别声音，返回整段全文、`utterances`、字词级 `words`
+- 脚本负责把 `utterances` 整理成适合短视频阅读的字幕
+- Codex / AI Agent 只负责运行脚本、检查结果、必要时修改 skill
+- 默认不调用 AI 重写字幕、不让 AI 决定每条字幕怎么分
+
+默认字幕长度策略
+
+- `DOUBAO_ASR_CAPTION_MIN_CHARS=8`
+- `DOUBAO_ASR_CAPTION_TARGET_CHARS=18`
+- `DOUBAO_ASR_CAPTION_MAX_CHARS=22`
+- `DOUBAO_ASR_CAPTION_PAUSE_SECONDS=0.45`
+- `DOUBAO_ASR_CAPTION_PUNCTUATION_OVERSHOOT=4`
+
+也就是说，脚本会尽量让字幕落在 8 到 22 个字之间，目标靠近 18 个字
+
+如果一句话马上要遇到标点，脚本允许最多多带 4 个字，避免把“视频。”切成“视 / 频。”这种不自然字幕
+
+标点只用于判断哪里适合断句，最终 `captions.json` 和 `srt` 默认不保留标点符号
+
+如果字幕太碎，优先调大 `DOUBAO_ASR_CAPTION_MIN_CHARS`
+
+如果字幕太长，优先调小 `DOUBAO_ASR_CAPTION_MAX_CHARS`
 
 极速版的限制需要记住
 

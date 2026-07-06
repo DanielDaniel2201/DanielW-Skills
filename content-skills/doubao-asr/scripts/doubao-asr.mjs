@@ -25,9 +25,11 @@ const sampleRate = Number(env.DOUBAO_ASR_SAMPLE_RATE || 16000);
 const channels = Number(env.DOUBAO_ASR_CHANNELS || 1);
 const audioBitrate = env.DOUBAO_ASR_AUDIO_BITRATE || "48k";
 const maxUploadBytes = Number(env.DOUBAO_ASR_MAX_UPLOAD_MB || 100) * 1024 * 1024;
-const minCaptionChars = Number(env.DOUBAO_ASR_CAPTION_MIN_CHARS || 10);
-const maxCaptionChars = Number(env.DOUBAO_ASR_CAPTION_MAX_CHARS || 15);
+const minCaptionChars = Number(env.DOUBAO_ASR_CAPTION_MIN_CHARS || 8);
+const targetCaptionChars = Number(env.DOUBAO_ASR_CAPTION_TARGET_CHARS || 18);
+const maxCaptionChars = Number(env.DOUBAO_ASR_CAPTION_MAX_CHARS || 22);
 const captionPauseSeconds = Number(env.DOUBAO_ASR_CAPTION_PAUSE_SECONDS || 0.45);
+const captionPunctuationOvershoot = Number(env.DOUBAO_ASR_CAPTION_PUNCTUATION_OVERSHOOT || 4);
 
 main().catch((error) => {
   console.error(`[asr] failed: ${error.message}`);
@@ -55,19 +57,21 @@ async function main() {
   const raw = await recognizeFlash(audio);
   fs.writeFileSync(rawOutPath, JSON.stringify(raw, null, 2), "utf8");
 
-  const words = extractWords(raw.body);
+  const utterances = extractUtterances(raw.body);
+  const words = extractWordsFromUtterances(utterances);
   if (!words.length) {
     throw new Error(`ASR returned no word or utterance timestamps. See ${rawOutPath}`);
   }
 
   fs.writeFileSync(transcriptOutPath, JSON.stringify(words, null, 2), "utf8");
 
-  const captions = buildCaptionGroups(cleanWords(words));
+  const captions = buildCaptionGroups(utterances, words);
   fs.writeFileSync(captionsOutPath, JSON.stringify(captions, null, 2), "utf8");
   fs.writeFileSync(srtOutPath, toSrt(captions), "utf8");
 
   const preview = captions.slice(0, 5).map((c) => c.text).join(" / ");
   console.log(`[asr] wrote ${words.length} words, ${captions.length} caption groups`);
+  console.log(`[asr] caption strategy=utterances + punctuation + length normalization`);
   console.log(`[asr] raw: ${rawOutPath}`);
   console.log(`[asr] transcript: ${transcriptOutPath}`);
   console.log(`[asr] captions: ${captionsOutPath}`);
@@ -210,35 +214,55 @@ function parseJson(text) {
   }
 }
 
-function extractWords(payload) {
+function extractUtterances(payload) {
   const result = payload?.result || payload || {};
   const utterances = Array.isArray(result.utterances) ? result.utterances : [];
-  const words = [];
+  const normalized = [];
 
   for (const utterance of utterances) {
+    const start = msToSeconds(utterance.start_time);
+    const end = msToSeconds(utterance.end_time);
+    const words = [];
+
     if (Array.isArray(utterance.words) && utterance.words.length) {
       for (const word of utterance.words) {
         const text = normalizeText(word.text);
         if (!text) continue;
+        const wordStart = msToSeconds(word.start_time ?? utterance.start_time);
+        const wordEnd = msToSeconds(word.end_time ?? utterance.end_time);
+        if (!Number.isFinite(wordStart) || !Number.isFinite(wordEnd) || wordEnd < wordStart) continue;
         words.push({
           text,
-          start: msToSeconds(word.start_time ?? utterance.start_time),
-          end: msToSeconds(word.end_time ?? utterance.end_time),
+          start: wordStart,
+          end: wordEnd,
         });
       }
-      continue;
     }
 
-    const text = normalizeText(utterance.text);
-    if (!text) continue;
-    words.push({
-      text,
-      start: msToSeconds(utterance.start_time),
-      end: msToSeconds(utterance.end_time),
+    if (!words.length) {
+      const text = normalizeText(utterance.text);
+      if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end < start) continue;
+      words.push({ text, start, end });
+    }
+
+    const sortedWords = dedupeWords(words).sort((a, b) => a.start - b.start || a.end - b.end);
+
+    normalized.push({
+      text: normalizeText(utterance.text),
+      start,
+      end,
+      words: sortedWords,
+      captionWords: attachPunctuationToWords(utterance.text, sortedWords),
     });
   }
 
-  return dedupeWords(words)
+  return normalized
+    .filter((u) => u.words.length)
+    .sort((a, b) => a.words[0].start - b.words[0].start || a.words.at(-1).end - b.words.at(-1).end);
+}
+
+function extractWordsFromUtterances(utterances) {
+  return dedupeWords(utterances.flatMap((utterance) => utterance.words))
     .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start)
     .sort((a, b) => a.start - b.start || a.end - b.end);
 }
@@ -252,36 +276,105 @@ function dedupeWords(words) {
   return [...byKey.values()];
 }
 
-function buildCaptionGroups(words) {
+function buildCaptionGroups(utterances, fallbackWords) {
+  let groups = [];
+
+  for (const utterance of utterances) {
+    groups.push(...splitWordsIntoCaptionGroups(cleanWords(utterance.captionWords || utterance.words)));
+  }
+
+  if (!groups.length) {
+    groups = splitWordsIntoCaptionGroups(cleanWords(fallbackWords));
+  }
+
+  const merged = mergeShortCaptionGroups(groups);
+  const split = merged.flatMap((group) => splitLongCaptionGroup(group));
+  return normalizeCaptionTimeline(split);
+}
+
+function splitWordsIntoCaptionGroups(words) {
   const groups = [];
   let current = [];
 
   const flush = () => {
     if (!current.length) return;
-    const text = current.map((w) => w.text).join("").replace(/\s+/g, " ").trim();
-    if (text) {
-      groups.push({
-        text,
-        start: round(current[0].start),
-        end: round(Math.max(current[current.length - 1].end, current[0].start + 0.45)),
-      });
-    }
+    const group = makeCaptionGroup(current);
+    if (group) groups.push(group);
     current = [];
   };
 
-  for (const word of words) {
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    const next = words[index + 1];
     const previous = current[current.length - 1];
-    const projected = current.map((w) => w.text).join("").length + word.text.length;
+    const projected = captionLength(joinWords([...current, word]));
     const pause = previous ? word.start - previous.end : 0;
-    const punctuationBreak = previous ? /[，。！？!?；;：:]$/.test(previous.text) : false;
-    if (current.length && (projected > maxCaptionChars || pause > captionPauseSeconds || punctuationBreak)) flush();
+
+    const canCarryToPunctuation =
+      projected <= maxCaptionChars + captionPunctuationOvershoot &&
+      (isBreakPunctuation(word.text) || (next && isBreakPunctuation(next.text)));
+
+    if (current.length && ((projected > maxCaptionChars && !canCarryToPunctuation) || pause > captionPauseSeconds)) flush();
+
     current.push(word);
-    const chars = current.map((w) => w.text).join("").length;
-    if (chars >= minCaptionChars && /[，。！？!?；;：:]$/.test(word.text)) flush();
+    const chars = captionLength(joinWords(current));
+    const nextPause = next ? next.start - word.end : 0;
+
+    if (
+      chars >= maxCaptionChars ||
+      (chars >= minCaptionChars && isBreakPunctuation(word.text)) ||
+      (chars >= targetCaptionChars && nextPause > captionPauseSeconds)
+    ) {
+      flush();
+    }
   }
   flush();
 
-  return groups.map((group, index, arr) => {
+  return groups;
+}
+
+function mergeShortCaptionGroups(groups) {
+  const queue = [...groups];
+  const merged = [];
+
+  for (let index = 0; index < queue.length; index += 1) {
+    const group = queue[index];
+    if (!group) continue;
+
+    if (captionLength(group.text) < minCaptionChars) {
+      const next = queue[index + 1];
+      if (next && canMergeCaptionGroups(group, next)) {
+        queue[index + 1] = makeCaptionGroup([...group.words, ...next.words]);
+        continue;
+      }
+
+      const previous = merged[merged.length - 1];
+      if (previous && canMergeCaptionGroups(previous, group)) {
+        merged[merged.length - 1] = makeCaptionGroup([...previous.words, ...group.words]);
+        continue;
+      }
+    }
+
+    merged.push(group);
+  }
+
+  return merged;
+}
+
+function splitLongCaptionGroup(group) {
+  if (captionLength(group.text) <= maxCaptionChars) return [group];
+  return splitWordsIntoCaptionGroups(group.words);
+}
+
+function normalizeCaptionTimeline(groups) {
+  return groups
+    .filter((group) => group && group.text)
+    .map((group) => ({
+      text: group.text,
+      start: group.start,
+      end: group.end,
+    }))
+    .map((group, index, arr) => {
     const next = arr[index + 1];
     if (next && group.end > next.start - 0.04) {
       return { ...group, end: round(Math.max(group.start + 0.35, next.start - 0.04)) };
@@ -290,10 +383,61 @@ function buildCaptionGroups(words) {
   });
 }
 
+function canMergeCaptionGroups(left, right) {
+  if (left.end > right.start + 0.05) return false;
+  const text = joinWords([...left.words, ...right.words]);
+  return captionLength(text) <= maxCaptionChars;
+}
+
+function makeCaptionGroup(words) {
+  if (!words.length) return null;
+  const text = stripCaptionPunctuation(joinWords(words));
+  if (!text) return null;
+  return {
+    text,
+    start: round(words[0].start),
+    end: round(Math.max(words[words.length - 1].end, words[0].start + 0.45)),
+    words,
+  };
+}
+
+function joinWords(words) {
+  let text = "";
+  for (const word of words) {
+    const token = String(word.text || "").trim();
+    if (!token) continue;
+    if (text && shouldInsertSpace(text, token)) text += " ";
+    text += token;
+  }
+  return text.replace(/\s+([，。！？；：、,.!?;:])/g, "$1").replace(/\s+/g, " ").trim();
+}
+
+function captionLength(text) {
+  return String(text || "").replace(/\s+/g, "").length;
+}
+
+function isBreakPunctuation(text) {
+  return /[，。！？!?；;：:、,.]$/.test(String(text || ""));
+}
+
+function stripCaptionPunctuation(text) {
+  return String(text || "")
+    .replace(/[，。！？!?；;：:、,.]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function shouldInsertSpace(left, right) {
+  return /[A-Za-z0-9]$/.test(left) && /^[A-Za-z0-9]/.test(right);
+}
+
 function cleanWords(words) {
   const fillerWords = new Set(["啊", "呃", "嗯", "uh", "um", "ah", "er"]);
   return words.filter((word, index, arr) => {
-    const text = String(word.text || "").trim().toLowerCase();
+    const text = String(word.text || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[，。！？!?；;：:、,.]+$/g, "");
     if (!fillerWords.has(text)) return true;
 
     const previous = arr[index - 1];
@@ -301,6 +445,33 @@ function cleanWords(words) {
     const prevGap = previous ? word.start - previous.end : Number.POSITIVE_INFINITY;
     const nextGap = next ? next.start - word.end : Number.POSITIVE_INFINITY;
     return prevGap > 0.55 && nextGap > 0.55;
+  });
+}
+
+function attachPunctuationToWords(text, words) {
+  const source = String(text || "").replace(/\s+/g, "");
+  if (!source || !words.length) return words;
+
+  const chars = Array.from(source);
+  let cursor = 0;
+
+  return words.map((word) => {
+    const token = normalizeText(word.text);
+    if (!token) return word;
+
+    const index = source.indexOf(token, cursor);
+    if (index === -1) return word;
+
+    let end = index + token.length;
+    let punctuation = "";
+    while (end < chars.length && isBreakPunctuation(chars[end])) {
+      punctuation += chars[end];
+      end += 1;
+    }
+
+    cursor = Math.max(cursor, end);
+    if (!punctuation) return word;
+    return { ...word, text: `${word.text}${punctuation}` };
   });
 }
 
